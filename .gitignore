@@ -1,7 +1,27 @@
 .DS_Store
-/.build
-/Packages
+
+# Xcode
 xcuserdata/
 DerivedData/
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+timeline.xctimeline
+playground.xcworkspace
+
+# Swift Package Manager
+.build/
+/.build
+/Packages
 .swiftpm/
 .netrc
+
+# Carthage
+Carthage/Build/
+
+# fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
