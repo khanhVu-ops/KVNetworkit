@@ -20,6 +20,7 @@ public final class KVMockAPIClient: KVAPIClientProtocol, @unchecked Sendable {
     private let lock = NSLock()
     private var stubbedValues: [String: any Encodable] = [:]
     private var stubbedData: [String: Data] = [:]
+    private var stubbedStreams: [String: [Data]] = [:]
     private var _requestedPaths: [String] = []
 
     /// When set, every request throws this error.
@@ -48,12 +49,30 @@ public final class KVMockAPIClient: KVAPIClientProtocol, @unchecked Sendable {
         stubbedData[path] = data
     }
 
+    /// Stubs a streamed response for an endpoint path, as ordered body chunks.
+    ///
+    /// ```swift
+    /// mock.stub(path: "/chat", streamChunks: KVMockNetworkSession.sseChunks(["hi", "[DONE]"]))
+    /// for try await event in try await mock.streamEvents(ChatEndpoint.interact) { ... }
+    /// ```
+    public func stub(path: String, streamChunks: [Data]) {
+        lock.lock()
+        defer { lock.unlock() }
+        stubbedStreams[path] = streamChunks
+    }
+
+    /// Stubs a streamed SSE response from plain payload strings.
+    public func stub(path: String, streamPayloads: [String]) {
+        stub(path: path, streamChunks: KVMockNetworkSession.sseChunks(streamPayloads))
+    }
+
     /// Clears all stubs, recorded paths and the stubbed error.
     public func reset() {
         lock.lock()
         defer { lock.unlock() }
         stubbedValues.removeAll()
         stubbedData.removeAll()
+        stubbedStreams.removeAll()
         _requestedPaths.removeAll()
         stubbedError = nil
     }
@@ -97,6 +116,26 @@ public final class KVMockAPIClient: KVAPIClientProtocol, @unchecked Sendable {
         return stubbedRawData(for: endpoint.path)
     }
 
+    public func stream(
+        _ endpoint: any KVAPIEndpointProtocol,
+        accept: String?,
+        id: String
+    ) async throws -> KVDataStream {
+        try throwIfStubbed()
+        recordRequest(endpoint.path)
+
+        guard let chunks = stubbedStream(for: endpoint.path) else {
+            throw KVAPIClientError.statusCode(404)
+        }
+
+        return KVDataStream(bufferingPolicy: .unbounded) { continuation in
+            for chunk in chunks {
+                continuation.yield(chunk)
+            }
+            continuation.finish()
+        }
+    }
+
     public func cancelRequest(with id: String) {}
     public func cancelAllRequests() {}
 
@@ -122,5 +161,11 @@ public final class KVMockAPIClient: KVAPIClientProtocol, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return stubbedData[path]
+    }
+
+    private func stubbedStream(for path: String) -> [Data]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stubbedStreams[path]
     }
 }

@@ -42,6 +42,26 @@ public protocol KVAPIClientProtocol: Sendable {
         id: String
     ) async throws -> Data?
 
+    /// Sends a request and returns the response body as it arrives, without buffering it.
+    ///
+    /// Use this for long-lived responses: server-sent events, LLM token streams,
+    /// NDJSON feeds. The call returns once the response head has been validated,
+    /// so a non-2xx status throws here — before the first chunk is consumed.
+    ///
+    /// Prefer ``streamEvents(_:framing:id:)`` or ``stream(_:as:decoder:framing:id:)``
+    /// unless you need the raw bytes.
+    ///
+    /// - Parameters:
+    ///   - endpoint: The endpoint to request. Its ``KVCachePolicy`` is ignored —
+    ///     streamed responses are never cached.
+    ///   - accept: `Accept` header applied only when the endpoint declares none.
+    ///   - id: A unique identifier for the request, usable with ``cancelRequest(with:)``.
+    func stream(
+        _ endpoint: any KVAPIEndpointProtocol,
+        accept: String?,
+        id: String
+    ) async throws -> KVDataStream
+
     /// Cancels the in-flight request with the given identifier.
     func cancelRequest(with id: String)
 
@@ -72,5 +92,124 @@ public extension KVAPIClientProtocol {
         progressDelegate: (any KVUploadProgressDelegateProtocol)?
     ) async throws -> Data? {
         try await request(endpoint, progressDelegate: progressDelegate, id: UUID().uuidString)
+    }
+}
+
+// MARK: - Streaming
+
+public extension KVAPIClientProtocol {
+
+    /// Streams the raw response chunks with a random id and no added `Accept` header.
+    func stream(_ endpoint: any KVAPIEndpointProtocol) async throws -> KVDataStream {
+        try await stream(endpoint, accept: nil, id: UUID().uuidString)
+    }
+
+    /// Streams the response as complete text lines.
+    ///
+    /// Chunk boundaries and multi-byte characters are reassembled, so every element
+    /// is a whole line. Useful for inspecting an unfamiliar stream format.
+    func streamLines(
+        _ endpoint: any KVAPIEndpointProtocol,
+        id: String = UUID().uuidString
+    ) async throws -> AsyncThrowingStream<String, any Error> {
+        let upstream = try await stream(endpoint, accept: nil, id: id)
+
+        return AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
+            let pump = Task {
+                var accumulator = KVLineAccumulator()
+                do {
+                    for try await chunk in upstream {
+                        for line in accumulator.lines(from: chunk) {
+                            continuation.yield(line)
+                        }
+                    }
+                    if let tail = accumulator.flush() { continuation.yield(tail) }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in pump.cancel() }
+        }
+    }
+
+    /// Streams the response as parsed ``KVServerSentEvent`` values.
+    ///
+    /// ```swift
+    /// for try await event in try await client.streamEvents(ChatEndpoint.interact(text)) {
+    ///     guard !event.isDoneSentinel else { break }
+    ///     let delta = try event.decode(ChatDelta.self)
+    ///     await appendToBubble(delta.content)
+    /// }
+    /// ```
+    ///
+    /// - Parameter framing: How the server delimits events. Defaults to spec SSE;
+    ///   use ``KVStreamFraming/serverSentEventsPerLine`` for backends that skip the
+    ///   blank separator line.
+    func streamEvents(
+        _ endpoint: any KVAPIEndpointProtocol,
+        framing: KVStreamFraming = .serverSentEvents,
+        id: String = UUID().uuidString
+    ) async throws -> AsyncThrowingStream<KVServerSentEvent, any Error> {
+        let upstream = try await stream(endpoint, accept: framing.acceptHeader, id: id)
+
+        return AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
+            let pump = Task {
+                var parser = KVSSEParser(framing: framing)
+                do {
+                    for try await chunk in upstream {
+                        for event in parser.parse(chunk) {
+                            continuation.yield(event)
+                        }
+                    }
+                    for event in parser.finish() {
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in pump.cancel() }
+        }
+    }
+
+    /// Streams the response as decoded values, one per event payload.
+    ///
+    /// The `[DONE]` sentinel and empty payloads are skipped; the stream ends when
+    /// the server closes the connection. A payload that fails to decode throws
+    /// ``KVAPIClientError/decodingFailed(_:)`` and ends the stream — use
+    /// ``streamEvents(_:framing:id:)`` when the server mixes in payload shapes you
+    /// want to ignore.
+    ///
+    /// ```swift
+    /// let deltas: AsyncThrowingStream<ChatDelta, any Error> = try await client.stream(
+    ///     ChatEndpoint.interact(text),
+    ///     as: ChatDelta.self
+    /// )
+    /// ```
+    func stream<T: Decodable>(
+        _ endpoint: any KVAPIEndpointProtocol,
+        as type: T.Type,
+        decoder: JSONDecoder = JSONDecoder(),
+        framing: KVStreamFraming = .serverSentEvents,
+        id: String = UUID().uuidString
+    ) async throws -> AsyncThrowingStream<T, any Error> {
+        let events = try await streamEvents(endpoint, framing: framing, id: id)
+
+        return AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
+            let pump = Task {
+                do {
+                    for try await event in events {
+                        guard !event.isDoneSentinel, !event.data.isEmpty else { continue }
+                        continuation.yield(try event.decode(T.self, decoder: decoder))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in pump.cancel() }
+        }
     }
 }

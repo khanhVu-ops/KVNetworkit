@@ -36,12 +36,36 @@ public struct KVLoggingInterceptor: KVNetworkInterceptorProtocol {
         }
     }
 
-    private let level: Level
+    /// How the body of a *streaming* response is logged.
+    ///
+    /// A stream has no single response body to print, so it gets its own setting.
+    /// Only applies at ``Level/body``.
+    public enum StreamBodyLogging: Sendable {
+        /// Log the open/close lines only — no body.
+        case none
+        /// Buffer the chunks and log the whole body once, when the stream closes.
+        /// This is the closest match to how a non-streamed response is logged.
+        case aggregated
+        /// Log every chunk as it arrives. Noisy for token streams, but the only way
+        /// to see how a server actually frames its events.
+        case perChunk
+    }
+
+    // Internal rather than private: the streaming half of this interceptor lives in
+    // `KVLoggingInterceptor+Streaming.swift`.
+    let level: Level
+    let maxBodyLogLength: Int
+    let output: @Sendable (String) -> Void
+
     private let redactsSensitiveHeaders: Bool
     private let sensitiveHeaders: Set<String>
-    private let maxBodyLogLength: Int
     private let logsInRelease: Bool
-    private let output: @Sendable (String) -> Void
+
+    let streamBodyLogging: StreamBodyLogging
+
+    /// Per-stream accumulation for ``StreamBodyLogging/aggregated``. A reference type so
+    /// copies of this (value-type) interceptor share one set of buffers.
+    let streamBuffers = KVStreamLogBuffers()
 
     /// - Parameters:
     ///   - level: Detail level. Defaults to `.body`.
@@ -50,6 +74,7 @@ public struct KVLoggingInterceptor: KVNetworkInterceptorProtocol {
     ///   - sensitiveHeaders: Case-insensitive header names to redact.
     ///   - maxBodyLogLength: Bodies longer than this are truncated. Defaults to 10 000 characters.
     ///   - logsInRelease: Also log in release builds. Defaults to `false`.
+    ///   - streamBodyLogging: How streaming bodies are logged. Defaults to `.aggregated`.
     ///   - output: Log sink. Defaults to `print`.
     public init(
         level: Level = .body,
@@ -57,8 +82,10 @@ public struct KVLoggingInterceptor: KVNetworkInterceptorProtocol {
         sensitiveHeaders: Set<String> = ["authorization", "cookie", "set-cookie", "x-api-key", "proxy-authorization"],
         maxBodyLogLength: Int = 10_000,
         logsInRelease: Bool = false,
+        streamBodyLogging: StreamBodyLogging = .aggregated,
         output: @escaping @Sendable (String) -> Void = { print($0) }
     ) {
+        self.streamBodyLogging = streamBodyLogging
         self.level = level
         self.redactsSensitiveHeaders = redactsSensitiveHeaders
         self.sensitiveHeaders = Set(sensitiveHeaders.map { $0.lowercased() })
@@ -84,7 +111,7 @@ public struct KVLoggingInterceptor: KVNetworkInterceptorProtocol {
 
 // MARK: - Formatting
 
-private extension KVLoggingInterceptor {
+extension KVLoggingInterceptor {
 
     var isEnabled: Bool {
         guard level != .none else { return false }

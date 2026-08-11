@@ -41,7 +41,10 @@ public final class KVAPIClient: KVAPIClientProtocol, @unchecked Sendable {
     /// The retry policy applied to every request.
     public let retryPolicy: KVRetryPolicy
 
-    private let taskManager: any KVTaskManagerProtocol
+    /// Internal so the streaming pipeline in `KVAPIClient+Streaming.swift` can track
+    /// long-lived stream tasks under the same identifiers as regular requests.
+    let taskManager: any KVTaskManagerProtocol
+
     private let uploadSessionFactory: @Sendable (any KVUploadProgressDelegateProtocol) -> any KVNetworkSessionProtocol
 
     // MARK: - Initialization
@@ -159,7 +162,10 @@ private extension KVAPIClient {
 
 // MARK: - Request pipeline
 
-private extension KVAPIClient {
+/// Internal rather than private: the streaming pipeline lives in
+/// `KVAPIClient+Streaming.swift` and reuses the interception, retry and
+/// validation steps below.
+extension KVAPIClient {
 
     @discardableResult
     func performRequest(

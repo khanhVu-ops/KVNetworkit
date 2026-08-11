@@ -16,6 +16,9 @@ struct ContentView: View {
             CreatePostView()
                 .tabItem { Label("Create", systemImage: "plus.circle") }
 
+            LiveStreamView()
+                .tabItem { Label("Stream", systemImage: "dot.radiowaves.left.and.right") }
+
             NetworkStatusView()
                 .tabItem { Label("Status", systemImage: "antenna.radiowaves.left.and.right") }
         }
