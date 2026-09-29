@@ -17,6 +17,7 @@ private struct TestEndpoint: KVAPIEndpointProtocol {
     var baseURL: String = "https://api.example.com"
     var body: KVHTTPBody?
     var cachePolicy: KVCachePolicy = .ignore
+    var retryPolicy: KVRetryPolicy?
 }
 
 private let testURL = URL(string: "https://api.example.com/users/me")!
@@ -139,6 +140,106 @@ final class KVAPIClientTests: XCTestCase {
 
         _ = try? await client.request(TestEndpoint()) as Void
         XCTAssertEqual(session.receivedRequests.count, 1)
+    }
+
+    func testPostIsNotRetriedByDefault() async {
+        let session = KVMockNetworkSession()
+        session.enqueue(.success((Data(), KVMockNetworkSession.httpResponse(url: testURL, statusCode: 503))))
+        session.enqueue(.success((userData(), KVMockNetworkSession.httpResponse(url: testURL, statusCode: 200))))
+        let client = KVAPIClient(
+            session: session,
+            interceptors: [],
+            retryPolicy: KVRetryPolicy(maxRetries: 2, baseDelay: 0.01)
+        )
+
+        do {
+            try await client.request(TestEndpoint(method: .post))
+            XCTFail("Expected the 503 to be surfaced")
+        } catch {
+            guard case KVAPIClientError.statusCode(503) = error else {
+                return XCTFail("Expected statusCode(503), got \(error)")
+            }
+        }
+        XCTAssertEqual(session.receivedRequests.count, 1)
+    }
+
+    func testPostTransportErrorIsNotRetriedByDefault() async {
+        let session = KVMockNetworkSession()
+        session.enqueue(.failure(URLError(.networkConnectionLost)))
+        session.enqueue(.success((userData(), KVMockNetworkSession.httpResponse(url: testURL, statusCode: 200))))
+        let client = KVAPIClient(session: session, interceptors: [], retryPolicy: .default)
+
+        _ = try? await client.request(TestEndpoint(method: .patch)) as Void
+        XCTAssertEqual(session.receivedRequests.count, 1)
+    }
+
+    func testEndpointCanOptOutOfRetry() async {
+        let session = KVMockNetworkSession()
+        session.enqueue(.success((Data(), KVMockNetworkSession.httpResponse(url: testURL, statusCode: 503))))
+        session.enqueue(.success((userData(), KVMockNetworkSession.httpResponse(url: testURL, statusCode: 200))))
+        let client = KVAPIClient(
+            session: session,
+            interceptors: [],
+            retryPolicy: KVRetryPolicy(maxRetries: 2, baseDelay: 0.01)
+        )
+
+        _ = try? await client.request(TestEndpoint(retryPolicy: .never)) as Void
+        XCTAssertEqual(session.receivedRequests.count, 1)
+    }
+
+    func testEndpointCanOptAPostIntoRetry() async throws {
+        let session = KVMockNetworkSession()
+        session.enqueue(.success((Data(), KVMockNetworkSession.httpResponse(url: testURL, statusCode: 503))))
+        session.enqueue(.success((userData(), KVMockNetworkSession.httpResponse(url: testURL, statusCode: 200))))
+        let client = KVAPIClient(session: session, interceptors: [], retryPolicy: .never)
+
+        let endpoint = TestEndpoint(
+            method: .post,
+            retryPolicy: KVRetryPolicy(maxRetries: 1, baseDelay: 0.01, retryableMethods: [.post])
+        )
+        let user: User = try await client.request(endpoint)
+        XCTAssertEqual(user.id, "1")
+        XCTAssertEqual(session.receivedRequests.count, 2)
+    }
+
+    func testRetryAfterHeaderOverridesBackoff() async throws {
+        let session = KVMockNetworkSession()
+        session.enqueue(.success((Data(), KVMockNetworkSession.httpResponse(
+            url: testURL,
+            statusCode: 429,
+            headers: ["Retry-After": "0"]
+        ))))
+        session.enqueue(.success((userData(), KVMockNetworkSession.httpResponse(url: testURL, statusCode: 200))))
+        // A 10s base delay would time the test out if `Retry-After: 0` were ignored.
+        let client = KVAPIClient(
+            session: session,
+            interceptors: [],
+            retryPolicy: KVRetryPolicy(maxRetries: 1, baseDelay: 10, maxDelay: 10)
+        )
+
+        let startedAt = Date()
+        let _: User = try await client.request(TestEndpoint())
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1)
+        XCTAssertEqual(session.receivedRequests.count, 2)
+    }
+
+    func testRetryAfterHeaderIsCappedByMaxDelay() async throws {
+        let session = KVMockNetworkSession()
+        session.enqueue(.success((Data(), KVMockNetworkSession.httpResponse(
+            url: testURL,
+            statusCode: 503,
+            headers: ["Retry-After": "3600"]
+        ))))
+        session.enqueue(.success((userData(), KVMockNetworkSession.httpResponse(url: testURL, statusCode: 200))))
+        let client = KVAPIClient(
+            session: session,
+            interceptors: [],
+            retryPolicy: KVRetryPolicy(maxRetries: 1, baseDelay: 0.01, maxDelay: 0.05)
+        )
+
+        let startedAt = Date()
+        let _: User = try await client.request(TestEndpoint())
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1)
     }
 
     // MARK: - Cache

@@ -8,24 +8,25 @@ A clean, protocol-oriented networking package for iOS 16+ built on `async/await`
 - 🔌 **Interceptor pipeline** — auth headers, logging, connectivity checks, custom headers
 - 📋 **cURL + response logging** — replayable cURL commands, pretty-printed JSON responses, sensitive-header redaction
 - 💾 **Response caching** — memory (LRU), disk, or hybrid; `cacheFirst` / `networkFirst` policies with TTL, per endpoint
-- 🔁 **Retry with exponential backoff** — configurable status codes, transport errors, jitter
+- 🔁 **Retry with exponential backoff** — idempotent methods only by default, per-endpoint override, `Retry-After`, jitter
 - 🔑 **Token refresh** — 401 handling with single-flight refresh coordination and loop protection
 - 📶 **Network monitoring** — `NWPathMonitor`-backed, observable from SwiftUI on both iOS 16 (`ObservableObject`) and iOS 17+ (`@Observable`)
 - ⬆️ **Upload support** — multipart form-data with progress reporting
 - 📡 **Streaming responses** — server-sent events, NDJSON and raw chunks as `AsyncThrowingStream`, for LLM/chat token streams
-- ❌ **Cancellation** — cancel individual requests by id, or all at once
+- ❌ **Cancellation** — follows the calling task (SwiftUI `.task`), or cancel by id / all at once
 - 🧪 **Test support** — mock client, session and interceptor ship with the package
 
 ## Installation
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/<your-org>/KVNetworkit.git", from: "2.0.0")
+    .package(url: "https://github.com/<your-org>/KVNetworkit.git", from: "2.1.0")
 ]
 ```
 
 Upgrading from 1.x? See [CHANGELOG.md](CHANGELOG.md) — one protocol requirement was added, and it
-only affects hand-written `KVAPIClientProtocol` conformers.
+only affects hand-written `KVAPIClientProtocol` conformers. 2.1 is source compatible with 2.0 but
+changes some defaults (no retries for `POST`/`PATCH`, full header redaction) — see the changelog.
 
 ## Quick start
 
@@ -79,7 +80,7 @@ enum UserEndpoint: KVAPIEndpointProtocol {
 }
 ```
 
-`Content-Type` is derived from `body` automatically. `headers`, `urlParams`, `timeout`, `cachePolicy` all have sensible defaults.
+`Content-Type` is derived from `body` automatically (unless `headers` declares one, in any casing). `headers`, `urlParams`, `timeout`, `cachePolicy`, `retryPolicy` all have sensible defaults.
 
 ### 2. Create a client
 
@@ -90,7 +91,7 @@ let client = KVAPIClient(
         KVAuthInterceptor(tokenProvider: { tokenStore.accessToken }), // Bearer token
         KVLoggingInterceptor()                                        // cURL + response logs (DEBUG only)
     ],
-    retryPolicy: .default,        // 2 retries, exponential backoff
+    retryPolicy: .default,        // 2 retries, exponential backoff, idempotent methods only
     cache: KVHybridCache()        // memory + disk
 )
 ```
@@ -108,10 +109,40 @@ try await client.request(UserEndpoint.update(name: "Khanh"))
 let progress = KVUploadProgressDelegate { print("Uploaded \(Int($0 * 100))%") }
 try await client.request(UserEndpoint.uploadAvatar(image: imageData), progressDelegate: progress)
 
-// Cancellation
+// Cancellation by id
 let id = UUID().uuidString
 async let result: User = client.request(UserEndpoint.profile, id: id)
 client.cancelRequest(with: id)   // -> throws KVAPIClientError.taskCanceled
+```
+
+Requests also follow the task that awaits them: when a SwiftUI `.task` is cancelled because its
+view went away, the `URLSession` task is cancelled and the call throws `.taskCanceled`.
+
+```swift
+.task { profile = try? await client.request(UserEndpoint.profile) }   // cancelled with the view
+```
+
+An id identifies one in-flight request: a second request with the same id throws
+`.taskInProgress` until the first finishes, after which the id can be reused.
+
+## Retry
+
+`KVRetryPolicy` retries retryable status codes (408, 429, 5xx) and transport errors with
+exponential backoff. Only **idempotent** methods — GET, HEAD, PUT, DELETE, OPTIONS — are retried by
+default: replaying a `POST` the server may already have processed can create a second order or a
+second charge. A `Retry-After` header (seconds or HTTP date) replaces the computed delay, capped at
+`maxDelay`.
+
+Endpoints can replace the client's policy:
+
+```swift
+var retryPolicy: KVRetryPolicy? {
+    switch self {
+    case .purchase: return .never                                   // never replay
+    case .search:   return KVRetryPolicy(maxRetries: 2, retryableMethods: [.post])  // POST, but safe
+    default:        return nil                                      // the client's policy
+    }
+}
 ```
 
 ## Streaming (SSE / NDJSON)
@@ -174,12 +205,17 @@ The `Accept` header is only added when the endpoint does not declare one. Start 
 
 - **Interceptors** run on the request as usual — auth headers, cURL logging, connectivity checks
 - **Retry** covers connection setup and the response head. Once chunks start flowing a failure is
-  surfaced instead of silently restarting, because the caller already consumed part of the output
+  surfaced instead of silently restarting, because the caller already consumed part of the output.
+  Streams are usually `POST`s, so they are only retried when the policy opts `POST` in
+- **No 5-minute cap**: streams run on a session whose resource timeout is 7 days
+  (`KVNetworkSession(streamResourceTimeout:)`); `requestTimeout` still fails a stream that goes
+  silent for that long
 - **Token refresh** works: a 401 is refreshed and retried once, exactly like a normal request
 - **Error bodies are read**, so a failed stream throws `.serverMessage("Quota exceeded", 429)` from the
   `try await` — before your `for` loop ever runs — instead of a bare status code
-- **Cancellation** by id: `client.cancelRequest(with: "chat")` ends the stream with `.taskCanceled`,
-  and dropping the stream cancels the underlying task
+- **Cancellation** by id: `client.cancelRequest(with: "chat")` ends the stream with `.taskCanceled` —
+  also while it is still connecting — and dropping the stream or cancelling the consuming task
+  cancels the underlying task
 - **Chunk boundaries are handled**: events split across TCP chunks, `\r\n` vs `\n`, multi-byte
   characters cut in half, and a trailing event with no final blank line are all reassembled correctly
 
@@ -252,7 +288,7 @@ KVLoggingInterceptor(level: .body, streamBodyLogging: .perChunk)
 POST https://api.example.com/api/v1/users/me
 curl -v \
   -X PATCH \
-  -H "Authorization: Bearer super••••••" \
+  -H "Authorization: ••••••" \
   -H "Content-Type: application/json" \
   -d "{\"name\": \"Khanh\"}" \
   "https://api.example.com/api/v1/users/me"
@@ -268,7 +304,7 @@ URL: https://api.example.com/api/v1/users/me
 ```
 
 - Levels: `.none`, `.basic` (method/URL/status), `.headers`, `.body` (default)
-- `Authorization`, `Cookie`, `X-API-Key`, … are redacted by default (`redactsSensitiveHeaders: false` to disable when you need a runnable cURL)
+- `Authorization`, `Cookie`, `Set-Cookie`, and any header whose name contains `key`, `token` or `secret` (`X-API-Key`, `X-Auth-Token`, …) are fully redacted by default. Tune with `sensitiveHeaders:` / `sensitiveHeaderKeywords:`, or `redactsSensitiveHeaders: false` when you need a runnable cURL
 - Silent in release builds unless `logsInRelease: true`
 - Custom sink: `KVLoggingInterceptor(output: { logger.debug("\($0)") })`
 
@@ -389,10 +425,12 @@ do {
     let user: User = try await client.request(UserEndpoint.profile)
 } catch let error as KVAPIClientError {
     switch error {
-    case .serverMessage(let message, let statusCode):
-        showAlert(message)                        // human-readable server error
-    case .unauthorized, .refreshTokenInvalid:
+    case .refreshTokenInvalid:
         logout()
+    case let e where e.statusCode == 401:         // a 401 no refresh interceptor recovered
+        logout()
+    case .serverMessage(let message, _):
+        showAlert(message)                        // human-readable server error
     case let e where e.isNetworkConnectivityError:
         showOfflineBanner()                       // do NOT logout here
     default:
@@ -402,6 +440,33 @@ do {
 ```
 
 Server error messages are extracted automatically from common payload shapes: `{"message": …}`, `{"error": …}`, `{"detail": …}`, `{"error": {"message": …}}`, `{"errors": […]}`.
+A body without one — including non-JSON, like a `text/plain` traceback — becomes `.statusCode(_:)`.
+
+A plain 401 is reported as `.serverMessage`/`.statusCode` with status 401, not as `.unauthorized`
+(that case is for interceptors that want to signal an unrecoverable session), so match on
+`error.statusCode == 401`.
+
+### Reading the full error body
+
+When the payload carries more than a message, have the client throw `KVHTTPErrorResponse` — status,
+headers and raw body — for the statuses you care about:
+
+```swift
+let client = KVAPIClient(
+    errorResponseMapper: { $0.statusCode == 402 ? $0 : nil }   // nil: the usual KVAPIClientError
+)
+
+do {
+    try await client.request(ChatEndpoint.send(text))
+} catch let error as KVHTTPErrorResponse {
+    // {"detail":"Insufficient credits","extra":{"currentCredits":67,"requiredCredits":120}}
+    let credits = try error.decode(InsufficientCredits.self)
+    print(error.statusCode, error.message ?? "", error.text ?? "")
+}
+```
+
+The mapper can also return your own error type (`try? $0.decode(CreditsError.self)`), which is
+thrown as is.
 
 ## Example app
 
@@ -421,5 +486,5 @@ The Stream tab is the shortest read for the streaming API — see
 ## Requirements
 
 - iOS 16.0+ / macOS 13.0+
-- Swift 5.9+
+- Swift 5.9+ (also builds in Swift 6 language mode)
 - No dependencies

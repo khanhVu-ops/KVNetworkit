@@ -12,8 +12,10 @@ import Foundation
 /// manager never grows unbounded.
 public final class KVTaskManager: KVTaskManagerProtocol, @unchecked Sendable {
 
-    /// Type-erased handle that keeps only what the manager needs: cancellation.
+    /// Type-erased handle that keeps only what the manager needs: cancellation,
+    /// and which registration owns the entry.
     private struct TaskHandle {
+        let registration: KVTaskRegistration?
         let cancel: @Sendable () -> Void
     }
 
@@ -33,7 +35,22 @@ public final class KVTaskManager: KVTaskManagerProtocol, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         canceledIds.remove(id)
-        handles[id] = TaskHandle(cancel: { task.cancel() })
+        handles[id] = TaskHandle(registration: nil, cancel: { task.cancel() })
+    }
+
+    public func register<T>(
+        _ registration: KVTaskRegistration,
+        task makeTask: () -> Task<T, any Error>
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard handles[registration.id] == nil else { return false }
+
+        // Creating the task under the lock is safe: `Task.init` only enqueues the work.
+        let task = makeTask()
+        canceledIds.remove(registration.id)
+        handles[registration.id] = TaskHandle(registration: registration, cancel: { task.cancel() })
+        return true
     }
 
     public func status(for id: String) -> KVTaskStatus {
@@ -48,6 +65,22 @@ public final class KVTaskManager: KVTaskManagerProtocol, @unchecked Sendable {
         defer { lock.unlock() }
         handles.removeValue(forKey: id)
         canceledIds.remove(id)
+    }
+
+    public func complete(_ registration: KVTaskRegistration) {
+        lock.lock()
+        defer { lock.unlock() }
+        switch handles[registration.id] {
+        case .some(let handle) where handle.registration == registration:
+            handles.removeValue(forKey: registration.id)
+            canceledIds.remove(registration.id)
+        case .none:
+            // Canceled earlier (the handle is already gone): clear the canceled marker.
+            canceledIds.remove(registration.id)
+        case .some:
+            // A newer request reused the id; its entry is not ours to remove.
+            break
+        }
     }
 
     public func cancel(id: String) {

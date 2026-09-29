@@ -33,18 +33,47 @@ public extension KVAPIClient {
             urlRequest.setValue(accept, forHTTPHeaderField: "Accept")
         }
 
-        if taskManager.status(for: id) == .inProgress {
+        let request = urlRequest
+        let retryPolicy = endpoint.retryPolicy ?? retryPolicy
+        let registration = KVTaskRegistration(id: id)
+        let head = KVStreamHead()
+
+        var storedContinuation: KVDataStream.Continuation?
+        let downstream = KVDataStream(bufferingPolicy: .unbounded) { storedContinuation = $0 }
+        guard let continuation = storedContinuation else {
+            throw KVAPIClientError.requestFailed(URLError(.unknown))
+        }
+
+        // One task covers the whole stream — connection setup and body — and claims the id
+        // up front, so `cancelRequest(with:)` works while connecting too, and a second
+        // stream under the same id is rejected before it opens a connection.
+        var createdTask: Task<Void, any Error>?
+        let isRegistered = taskManager.register(registration) {
+            let task = Task<Void, any Error> {
+                await self.runStream(
+                    request,
+                    retryPolicy: retryPolicy,
+                    registration: registration,
+                    head: head,
+                    continuation: continuation
+                )
+            }
+            createdTask = task
+            return task
+        }
+        guard isRegistered, let pump = createdTask else {
+            continuation.finish()
             throw KVAPIClientError.taskInProgress
         }
+        continuation.onTermination = { _ in pump.cancel() }
 
-        let (upstream, response) = try await establishStream(urlRequest)
-
-        let streamInterceptors = interceptors.compactMap { $0 as? any KVStreamInterceptorProtocol }
-        for interceptor in streamInterceptors {
-            await interceptor.streamDidOpen(id: id, response: response)
+        // Canceling the caller while the connection is being set up cancels the stream.
+        try await withTaskCancellationHandler {
+            try await head.wait()
+        } onCancel: {
+            pump.cancel()
         }
-
-        return trackedStream(upstream, id: id, interceptors: streamInterceptors)
+        return downstream
     }
 }
 
@@ -57,8 +86,10 @@ private extension KVAPIClient {
     /// - Returns: The body chunk stream and the validated HTTP response.
     func establishStream(
         _ originalRequest: URLRequest,
+        retryPolicy: KVRetryPolicy,
         hasRefreshedToken: Bool = false
     ) async throws -> (KVDataStream, HTTPURLResponse) {
+        let maxRetries = retryPolicy.shouldRetry(method: originalRequest.httpMethod) ? retryPolicy.maxRetries : 0
         var attempt = 0
 
         while true {
@@ -88,7 +119,11 @@ private extension KVAPIClient {
                 // 5. Token refresh — at most one refresh-and-retry per logical request.
                 if !hasRefreshedToken,
                    try await shouldRetryAfterTokenRefresh(response: response, data: errorData) {
-                    return try await establishStream(originalRequest, hasRefreshedToken: true)
+                    return try await establishStream(
+                        originalRequest,
+                        retryPolicy: retryPolicy,
+                        hasRefreshedToken: true
+                    )
                 }
 
                 let (finalData, finalResponse) = try await interceptResponse(
@@ -97,9 +132,9 @@ private extension KVAPIClient {
                 )
 
                 // 6. Retry on retryable status codes.
-                if retryPolicy.shouldRetry(statusCode: http.statusCode), attempt < retryPolicy.maxRetries {
+                if retryPolicy.shouldRetry(statusCode: http.statusCode), attempt < maxRetries {
                     attempt += 1
-                    try await backoff(attempt: attempt)
+                    try await backoff(attempt: attempt, policy: retryPolicy, response: http)
                     continue
                 }
 
@@ -107,14 +142,14 @@ private extension KVAPIClient {
                 try validateResponse(finalResponse, data: finalData)
                 throw KVAPIClientError.statusCode(http.statusCode)
             } catch {
-                if error is CancellationError { throw error }
+                if error is CancellationError || Task.isCancelled { throw CancellationError() }
 
                 let mappedError = mapError(error)
 
                 // Retry on retryable transport errors.
-                if retryPolicy.shouldRetry(error: mappedError), attempt < retryPolicy.maxRetries {
+                if retryPolicy.shouldRetry(error: mappedError), attempt < maxRetries {
                     attempt += 1
-                    try await backoff(attempt: attempt)
+                    try await backoff(attempt: attempt, policy: retryPolicy, response: nil)
                     continue
                 }
 
@@ -134,71 +169,84 @@ private extension KVAPIClient {
         return modified
     }
 
-    /// Re-publishes the transport stream through a cancellable, identifier-tracked task
-    /// so `cancelRequest(with:)` and `cancelAllRequests()` also stop streams, running
-    /// each chunk past the stream interceptors on the way.
-    func trackedStream(
-        _ upstream: KVDataStream,
-        id: String,
-        interceptors streamInterceptors: [any KVStreamInterceptorProtocol]
-    ) -> KVDataStream {
-        var storedContinuation: KVDataStream.Continuation?
-        let downstream = KVDataStream(bufferingPolicy: .unbounded) { storedContinuation = $0 }
-        guard let continuation = storedContinuation else { return upstream }
+    /// The body of a stream's tracked task: opens the connection, reports the outcome to the
+    /// waiting `stream(_:accept:id:)` call, then re-publishes the transport stream into
+    /// `continuation`, running each chunk past the stream interceptors on the way.
+    ///
+    /// Tracking this task is what lets `cancelRequest(with:)` and `cancelAllRequests()`
+    /// stop streams.
+    func runStream(
+        _ request: URLRequest,
+        retryPolicy: KVRetryPolicy,
+        registration: KVTaskRegistration,
+        head: KVStreamHead,
+        continuation: KVDataStream.Continuation
+    ) async {
+        let id = registration.id
+        defer { taskManager.complete(registration) }
 
-        let pump = Task<Void, any Error> {
-            let startedAt = Date()
-            var chunkCount = 0
-            var byteCount = 0
-            var failure: (any Error)?
-
-            do {
-                for try await chunk in upstream {
-                    try Task.checkCancellation()
-
-                    var payload = chunk
-                    for interceptor in streamInterceptors {
-                        if let replacement = try await interceptor.stream(id: id, didReceive: payload) {
-                            payload = replacement
-                        }
-                    }
-
-                    chunkCount += 1
-                    byteCount += payload.count
-                    continuation.yield(payload)
-                }
-                // A cancelled `AsyncThrowingStream` may simply end instead of throwing,
-                // so an ended-because-cancelled stream is reported as a cancellation
-                // rather than a clean completion.
-                if Task.isCancelled {
-                    failure = KVAPIClientError.taskCanceled
-                }
-            } catch is CancellationError {
-                failure = KVAPIClientError.taskCanceled
-            } catch {
-                failure = mapError(error)
-            }
-
-            // Interceptors are told before the consumer's loop ends, so that by the time
-            // `for try await` returns or throws, logging and metrics have already run —
-            // the same ordering a non-streamed request gets from its response interceptors.
-            let statistics = KVStreamStatistics(
-                chunkCount: chunkCount,
-                byteCount: byteCount,
-                duration: Date().timeIntervalSince(startedAt)
-            )
+        let upstream: KVDataStream
+        let streamInterceptors = interceptors.compactMap { $0 as? any KVStreamInterceptorProtocol }
+        do {
+            let (body, response) = try await establishStream(request, retryPolicy: retryPolicy)
             for interceptor in streamInterceptors {
-                await interceptor.streamDidClose(id: id, statistics: statistics, error: failure)
+                await interceptor.streamDidOpen(id: id, response: response)
             }
-
+            upstream = body
+        } catch {
+            // Nothing opened, so stream interceptors are not told about it.
+            let failure = error is CancellationError ? KVAPIClientError.taskCanceled : error
+            head.resolve(.failure(failure))
             continuation.finish(throwing: failure)
-            taskManager.complete(id: id)
+            return
+        }
+        head.resolve(.success(()))
+
+        let startedAt = Date()
+        var chunkCount = 0
+        var byteCount = 0
+        var failure: (any Error)?
+
+        do {
+            for try await chunk in upstream {
+                try Task.checkCancellation()
+
+                var payload = chunk
+                for interceptor in streamInterceptors {
+                    if let replacement = try await interceptor.stream(id: id, didReceive: payload) {
+                        payload = replacement
+                    }
+                }
+
+                chunkCount += 1
+                byteCount += payload.count
+                continuation.yield(payload)
+            }
+            // A cancelled `AsyncThrowingStream` may simply end instead of throwing,
+            // so an ended-because-cancelled stream is reported as a cancellation
+            // rather than a clean completion.
+            if Task.isCancelled {
+                failure = KVAPIClientError.taskCanceled
+            }
+        } catch is CancellationError {
+            failure = KVAPIClientError.taskCanceled
+        } catch {
+            failure = Task.isCancelled ? KVAPIClientError.taskCanceled : mapError(error)
         }
 
-        taskManager.register(pump, for: id)
-        continuation.onTermination = { _ in pump.cancel() }
+        // Interceptors are told before the consumer's loop ends, so that by the time
+        // `for try await` returns or throws, logging and metrics have already run —
+        // the same ordering a non-streamed request gets from its response interceptors.
+        let statistics = KVStreamStatistics(
+            chunkCount: chunkCount,
+            byteCount: byteCount,
+            duration: Date().timeIntervalSince(startedAt)
+        )
+        for interceptor in streamInterceptors {
+            await interceptor.streamDidClose(id: id, statistics: statistics, error: failure)
+        }
 
-        return downstream
+        continuation.finish(throwing: failure)
     }
 
     /// Reads a stream to completion, for error payloads only.
@@ -217,5 +265,43 @@ private extension KVAPIClient {
             // Ignored: a partial payload is still better than none.
         }
         return data
+    }
+}
+
+// MARK: - Stream head
+
+/// One-shot hand-off of a stream's opening outcome from its task to the waiting caller.
+///
+/// Whichever of `resolve` and `wait` runs first, the waiter is resumed exactly once.
+final class KVStreamHead: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<Void, any Error>?
+    private var waiter: CheckedContinuation<Void, any Error>?
+
+    func resolve(_ outcome: Result<Void, any Error>) {
+        lock.lock()
+        guard result == nil else {
+            lock.unlock()
+            return
+        }
+        result = outcome
+        let pending = waiter
+        waiter = nil
+        lock.unlock()
+
+        pending?.resume(with: outcome)
+    }
+
+    func wait() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            lock.lock()
+            if let result {
+                lock.unlock()
+                continuation.resume(with: result)
+            } else {
+                waiter = continuation
+                lock.unlock()
+            }
+        }
     }
 }

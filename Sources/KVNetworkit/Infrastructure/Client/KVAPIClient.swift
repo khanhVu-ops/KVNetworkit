@@ -11,7 +11,8 @@ import Foundation
 /// 1. Build the `URLRequest` from the endpoint.
 /// 2. Serve from cache when the endpoint's ``KVCachePolicy`` allows it.
 /// 3. Run request interceptors (auth headers, logging, connectivity check, ...).
-/// 4. Execute the request, retrying per ``KVRetryPolicy`` with exponential backoff.
+/// 4. Execute the request, retrying per ``KVRetryPolicy`` with exponential backoff
+///    (idempotent methods only, unless the policy says otherwise).
 /// 5. Handle token refresh via ``KVTokenRefreshingInterceptorProtocol`` (at most once per request).
 /// 6. Run response interceptors, validate the status code, store to cache.
 ///
@@ -38,8 +39,12 @@ public final class KVAPIClient: KVAPIClientProtocol, @unchecked Sendable {
     /// `await client.cache?.removeAll()`.
     public let cache: (any KVNetworkCacheProtocol)?
 
-    /// The retry policy applied to every request.
+    /// The retry policy applied to every request whose endpoint does not declare its own
+    /// ``KVAPIEndpointProtocol/retryPolicy``.
     public let retryPolicy: KVRetryPolicy
+
+    /// Maps error responses to the error thrown to the caller; see ``KVHTTPErrorResponse``.
+    public let errorResponseMapper: KVErrorResponseMapper?
 
     /// Internal so the streaming pipeline in `KVAPIClient+Streaming.swift` can track
     /// long-lived stream tasks under the same identifiers as regular requests.
@@ -54,13 +59,18 @@ public final class KVAPIClient: KVAPIClientProtocol, @unchecked Sendable {
     ///   - interceptors: Applied to every request/response in order. Defaults to a ``KVLoggingInterceptor``.
     ///   - retryPolicy: Backoff/retry behavior. Defaults to ``KVRetryPolicy/never``.
     ///   - cache: Optional response cache. Endpoints opt in via ``KVAPIEndpointProtocol/cachePolicy``.
+    ///   - errorResponseMapper: Builds the error thrown for a non-2xx response, from its status,
+    ///     headers and raw body. Return `nil` for the default ``KVAPIClientError``. Defaults to `nil`.
     ///   - taskManager: Tracks in-flight tasks for cancellation. Defaults to a fresh ``KVTaskManager``.
-    ///   - uploadSessionFactory: Builds the session used for progress-tracked uploads.
+    ///   - uploadSessionFactory: Builds the session used for progress-tracked uploads. The
+    ///     session is released when the upload finishes; a ``KVNetworkSession`` invalidates its
+    ///     `URLSession` at that point, so a session per upload does not leak.
     public init(
         session: any KVNetworkSessionProtocol = KVNetworkSession(),
         interceptors: [any KVNetworkInterceptorProtocol] = [KVLoggingInterceptor()],
         retryPolicy: KVRetryPolicy = .never,
         cache: (any KVNetworkCacheProtocol)? = nil,
+        errorResponseMapper: KVErrorResponseMapper? = nil,
         taskManager: any KVTaskManagerProtocol = KVTaskManager(),
         uploadSessionFactory: @escaping @Sendable (any KVUploadProgressDelegateProtocol) -> any KVNetworkSessionProtocol = { delegate in
             KVNetworkSession(requestTimeout: 60, resourceTimeout: 600, delegate: delegate)
@@ -70,6 +80,7 @@ public final class KVAPIClient: KVAPIClientProtocol, @unchecked Sendable {
         self.interceptors = interceptors
         self.retryPolicy = retryPolicy
         self.cache = cache
+        self.errorResponseMapper = errorResponseMapper
         self.taskManager = taskManager
         self.uploadSessionFactory = uploadSessionFactory
     }
@@ -85,13 +96,18 @@ public final class KVAPIClient: KVAPIClientProtocol, @unchecked Sendable {
             throw KVAPIClientError.invalidURL
         }
 
-        return try await executeTracked(id: id) {
-            let data = try await self.performRequest(urlRequest, cachePolicy: endpoint.cachePolicy)
-            do {
-                return try decoder.decode(T.self, from: data)
-            } catch {
-                throw KVAPIClientError.decodingFailed(error)
-            }
+        let cachePolicy = endpoint.cachePolicy
+        let retryPolicy = endpoint.retryPolicy ?? retryPolicy
+
+        // Decoding happens here, in the caller's task: only `Data` crosses the task boundary,
+        // so `T` does not have to be `Sendable`.
+        let data = try await executeTracked(id: id) {
+            try await self.performRequest(urlRequest, cachePolicy: cachePolicy, retryPolicy: retryPolicy)
+        }
+        do {
+            return try decoder.decode(T.self, from: data)
+        } catch {
+            throw KVAPIClientError.decodingFailed(error)
         }
     }
 
@@ -103,8 +119,11 @@ public final class KVAPIClient: KVAPIClientProtocol, @unchecked Sendable {
             throw KVAPIClientError.invalidURL
         }
 
+        let cachePolicy = endpoint.cachePolicy
+        let retryPolicy = endpoint.retryPolicy ?? retryPolicy
+
         _ = try await executeTracked(id: id) {
-            try await self.performRequest(urlRequest, cachePolicy: endpoint.cachePolicy)
+            try await self.performRequest(urlRequest, cachePolicy: cachePolicy, retryPolicy: retryPolicy)
         }
     }
 
@@ -118,10 +137,14 @@ public final class KVAPIClient: KVAPIClientProtocol, @unchecked Sendable {
             throw KVAPIClientError.invalidURL
         }
 
+        let cachePolicy = endpoint.cachePolicy
+        let retryPolicy = endpoint.retryPolicy ?? retryPolicy
+
         return try await executeTracked(id: id) {
             try await self.performRequest(
                 urlRequest,
-                cachePolicy: endpoint.cachePolicy,
+                cachePolicy: cachePolicy,
+                retryPolicy: retryPolicy,
                 progressDelegate: progressDelegate
             )
         }
@@ -140,22 +163,38 @@ public final class KVAPIClient: KVAPIClientProtocol, @unchecked Sendable {
 
 private extension KVAPIClient {
     /// Wraps an operation in a cancellable, identifier-tracked task.
-    func executeTracked<T>(
+    ///
+    /// The task is canceled by ``cancelRequest(with:)`` *and* when the caller's own task is
+    /// canceled (e.g. a SwiftUI `.task` whose view disappears); both throw
+    /// ``KVAPIClientError/taskCanceled``.
+    func executeTracked<T: Sendable>(
         id: String,
-        operation: @escaping () async throws -> T
+        operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        if taskManager.status(for: id) == .inProgress {
+        let registration = KVTaskRegistration(id: id)
+        var createdTask: Task<T, any Error>?
+        let isRegistered = taskManager.register(registration) {
+            let task = Task { try await operation() }
+            createdTask = task
+            return task
+        }
+        guard isRegistered, let task = createdTask else {
             throw KVAPIClientError.taskInProgress
         }
-
-        let task = Task { try await operation() }
-        taskManager.register(task, for: id)
-        defer { taskManager.complete(id: id) }
+        defer { taskManager.complete(registration) }
 
         do {
-            return try await task.value
-        } catch is CancellationError {
-            throw KVAPIClientError.taskCanceled
+            return try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+        } catch {
+            // A canceled `URLSession` task surfaces as `URLError(.cancelled)`, not `CancellationError`.
+            if error is CancellationError || task.isCancelled {
+                throw KVAPIClientError.taskCanceled
+            }
+            throw error
         }
     }
 }
@@ -171,6 +210,7 @@ extension KVAPIClient {
     func performRequest(
         _ originalRequest: URLRequest,
         cachePolicy: KVCachePolicy,
+        retryPolicy: KVRetryPolicy,
         progressDelegate: (any KVUploadProgressDelegateProtocol)? = nil,
         hasRefreshedToken: Bool = false
     ) async throws -> Data {
@@ -184,7 +224,9 @@ extension KVAPIClient {
             return entry.data
         }
 
+        // Released when this call returns, which lets a per-upload session invalidate itself.
         let activeSession = progressDelegate.map(uploadSessionFactory) ?? session
+        let maxRetries = retryPolicy.shouldRetry(method: originalRequest.httpMethod) ? retryPolicy.maxRetries : 0
         var attempt = 0
 
         while true {
@@ -203,6 +245,7 @@ extension KVAPIClient {
                     return try await performRequest(
                         originalRequest,
                         cachePolicy: cachePolicy,
+                        retryPolicy: retryPolicy,
                         progressDelegate: progressDelegate,
                         hasRefreshedToken: true
                     )
@@ -214,9 +257,9 @@ extension KVAPIClient {
                 // 6. Retry on retryable status codes.
                 if let http = finalResponse as? HTTPURLResponse,
                    retryPolicy.shouldRetry(statusCode: http.statusCode),
-                   attempt < retryPolicy.maxRetries {
+                   attempt < maxRetries {
                     attempt += 1
-                    try await backoff(attempt: attempt)
+                    try await backoff(attempt: attempt, policy: retryPolicy, response: http)
                     continue
                 }
 
@@ -225,14 +268,16 @@ extension KVAPIClient {
                 await storeInCache(finalData, response: finalResponse, policy: cachePolicy, key: cacheKey)
                 return finalData
             } catch {
-                if error is CancellationError { throw error }
+                // Canceling the task also cancels the `URLSession` task, which then fails
+                // with `URLError(.cancelled)`; report that as the cancellation it is.
+                if error is CancellationError || Task.isCancelled { throw CancellationError() }
 
                 let mappedError = mapError(error)
 
                 // Retry on retryable transport errors.
-                if retryPolicy.shouldRetry(error: mappedError), attempt < retryPolicy.maxRetries {
+                if retryPolicy.shouldRetry(error: mappedError), attempt < maxRetries {
                     attempt += 1
-                    try await backoff(attempt: attempt)
+                    try await backoff(attempt: attempt, policy: retryPolicy, response: nil)
                     continue
                 }
 
@@ -249,8 +294,11 @@ extension KVAPIClient {
         }
     }
 
-    func backoff(attempt: Int) async throws {
-        let delay = retryPolicy.delay(forAttempt: attempt)
+    func backoff(attempt: Int, policy: KVRetryPolicy, response: HTTPURLResponse?) async throws {
+        let delay = policy.delay(
+            forAttempt: attempt,
+            retryAfter: response?.value(forHTTPHeaderField: "Retry-After")
+        )
         guard delay > 0 else { return }
         try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
@@ -295,10 +343,13 @@ extension KVAPIClient {
         }
 
         guard (200...299).contains(httpResponse.statusCode) else {
-            if let message = KVServerErrorMessage.extract(from: data) {
-                throw KVAPIClientError.serverMessage(message: message, statusCode: httpResponse.statusCode)
+            // Bodies are not assumed to be JSON: a `text/plain` traceback simply has no
+            // extractable message and becomes `.statusCode`.
+            let errorResponse = KVHTTPErrorResponse(response: httpResponse, data: data)
+            if let mapped = errorResponseMapper?(errorResponse) {
+                throw KVMappedResponseError(error: mapped)
             }
-            throw KVAPIClientError.statusCode(httpResponse.statusCode)
+            throw errorResponse.clientError
         }
     }
 
@@ -324,16 +375,25 @@ extension KVAPIClient {
     }
 
     func mapError(_ error: Error) -> Error {
+        if let mapped = error as? KVMappedResponseError {
+            return mapped.error
+        }
         if let urlError = error as? URLError {
             return urlError.code == .timedOut
                 ? KVAPIClientError.timeout
                 : KVAPIClientError.networkError(urlError)
         }
-        if error is KVAPIClientError || error is DecodingError {
+        if error is KVAPIClientError || error is DecodingError || error is KVHTTPErrorResponse {
             return error
         }
         return KVAPIClientError.requestFailed(error)
     }
+}
+
+/// Carries an error built by ``KVAPIClient/errorResponseMapper`` through `mapError(_:)`
+/// untouched, instead of it being wrapped in ``KVAPIClientError/requestFailed(_:)``.
+struct KVMappedResponseError: Error {
+    let error: any Error
 }
 
 // MARK: - Server error message extraction

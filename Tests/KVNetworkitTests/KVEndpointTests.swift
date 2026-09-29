@@ -19,6 +19,22 @@ private struct TestEndpoint: KVAPIEndpointProtocol {
 
 final class KVEndpointTests: XCTestCase {
 
+    func testLowercaseContentTypeHeaderIsNotOverridden() {
+        var endpoint = TestEndpoint()
+        endpoint.method = .post
+        endpoint.headers = ["content-type": "application/vnd.api+json"]
+        endpoint.body = .json(Data("{}".utf8))
+
+        let request = endpoint.urlRequest
+        XCTAssertEqual(request?.value(forHTTPHeaderField: "Content-Type"), "application/vnd.api+json")
+        let contentTypeFields = request?.allHTTPHeaderFields?.keys.filter { $0.lowercased() == "content-type" }
+        XCTAssertEqual(contentTypeFields?.count, 1)
+    }
+
+    func testRetryPolicyDefaultsToTheClientPolicy() {
+        XCTAssertNil(TestEndpoint().retryPolicy)
+    }
+
     func testBuildsURLWithVersionAndPath() {
         let request = TestEndpoint().urlRequest
         XCTAssertEqual(request?.url?.absoluteString, "https://api.example.com/api/v1/users")
