@@ -8,7 +8,8 @@ import Foundation
 /// Logs outgoing requests as replayable cURL commands and incoming responses
 /// as pretty-printed JSON.
 ///
-/// Sensitive headers (`Authorization`, `Cookie`, ...) are redacted by default.
+/// Sensitive headers (`Authorization`, `Cookie`, anything named like `*key*`, `*token*`,
+/// `*secret*`, ...) are fully redacted by default.
 /// Logging is compiled in but disabled in release builds unless `logsInRelease` is set.
 ///
 /// ```swift
@@ -59,6 +60,7 @@ public struct KVLoggingInterceptor: KVNetworkInterceptorProtocol {
 
     private let redactsSensitiveHeaders: Bool
     private let sensitiveHeaders: Set<String>
+    private let sensitiveHeaderKeywords: Set<String>
     private let logsInRelease: Bool
 
     let streamBodyLogging: StreamBodyLogging
@@ -72,6 +74,9 @@ public struct KVLoggingInterceptor: KVNetworkInterceptorProtocol {
     ///   - redactsSensitiveHeaders: Masks values of `sensitiveHeaders`. Defaults to `true`.
     ///     Disable temporarily when you need a copy-paste-runnable cURL with real credentials.
     ///   - sensitiveHeaders: Case-insensitive header names to redact.
+    ///   - sensitiveHeaderKeywords: Also redact any header whose name contains one of these,
+    ///     case-insensitively — catches `X-API-Key`, `X-Auth-Token`, `Client-Secret` and the like
+    ///     without listing each one. Pass `[]` to match `sensitiveHeaders` exactly.
     ///   - maxBodyLogLength: Bodies longer than this are truncated. Defaults to 10 000 characters.
     ///   - logsInRelease: Also log in release builds. Defaults to `false`.
     ///   - streamBodyLogging: How streaming bodies are logged. Defaults to `.aggregated`.
@@ -80,6 +85,7 @@ public struct KVLoggingInterceptor: KVNetworkInterceptorProtocol {
         level: Level = .body,
         redactsSensitiveHeaders: Bool = true,
         sensitiveHeaders: Set<String> = ["authorization", "cookie", "set-cookie", "x-api-key", "proxy-authorization"],
+        sensitiveHeaderKeywords: Set<String> = ["key", "token", "secret"],
         maxBodyLogLength: Int = 10_000,
         logsInRelease: Bool = false,
         streamBodyLogging: StreamBodyLogging = .aggregated,
@@ -89,6 +95,7 @@ public struct KVLoggingInterceptor: KVNetworkInterceptorProtocol {
         self.level = level
         self.redactsSensitiveHeaders = redactsSensitiveHeaders
         self.sensitiveHeaders = Set(sensitiveHeaders.map { $0.lowercased() })
+        self.sensitiveHeaderKeywords = Set(sensitiveHeaderKeywords.map { $0.lowercased() }.filter { !$0.isEmpty })
         self.maxBodyLogLength = maxBodyLogLength
         self.logsInRelease = logsInRelease
         self.output = output
@@ -207,12 +214,18 @@ extension KVLoggingInterceptor {
         return "<\(data.count) bytes of binary data>"
     }
 
+    /// Masks the whole value: even a prefix of a credential (`Bearer eyJhbGciOi…`) can leak
+    /// enough to identify or narrow down a secret.
     func redactedIfNeeded(header key: String, value: String) -> String {
-        guard redactsSensitiveHeaders, sensitiveHeaders.contains(key.lowercased()) else {
+        guard redactsSensitiveHeaders, isSensitive(header: key) else {
             return value
         }
-        let visiblePrefix = value.prefix(12)
-        return "\(visiblePrefix)••••••"
+        return "••••••"
+    }
+
+    func isSensitive(header key: String) -> Bool {
+        let name = key.lowercased()
+        return sensitiveHeaders.contains(name) || sensitiveHeaderKeywords.contains { name.contains($0) }
     }
 
     func escapeForCURL(_ value: String) -> String {

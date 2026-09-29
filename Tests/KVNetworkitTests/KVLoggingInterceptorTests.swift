@@ -56,7 +56,61 @@ final class KVLoggingInterceptorTests: XCTestCase {
         _ = try await interceptor.intercept(request: makeRequest())
 
         XCTAssertFalse(sink.text.contains("super-secret-token-value"))
-        XCTAssertTrue(sink.text.contains("Bearer super••••••"))
+        XCTAssertFalse(sink.text.contains("Bearer"), "No part of a credential may be logged")
+        XCTAssertTrue(sink.text.contains("Authorization: ••••••"))
+    }
+
+    func testAPIKeyAndTokenLikeHeadersAreFullyMasked() async throws {
+        let sink = LogSink()
+        let interceptor = KVLoggingInterceptor(output: { sink.append($0) })
+
+        var request = makeRequest()
+        request.setValue("sk-live-1234567890abcdef", forHTTPHeaderField: "x-api-key")
+        request.setValue("tok-abcdef", forHTTPHeaderField: "X-Auth-Token")
+        request.setValue("shh", forHTTPHeaderField: "Client-Secret")
+        request.setValue("session=abc", forHTTPHeaderField: "Cookie")
+        _ = try await interceptor.intercept(request: request)
+
+        let log = sink.text
+        for secret in ["sk-live", "1234567890abcdef", "tok-abcdef", "shh", "session=abc"] {
+            XCTAssertFalse(log.contains(secret), "\(secret) leaked into the log")
+        }
+        XCTAssertTrue(log.contains("x-api-key: ••••••") || log.contains("X-Api-Key: ••••••"))
+        XCTAssertTrue(log.contains("Content-Type: application/json"), "Ordinary headers stay readable")
+    }
+
+    func testSetCookieResponseHeaderIsMasked() async throws {
+        let sink = LogSink()
+        let interceptor = KVLoggingInterceptor(level: .headers, output: { sink.append($0) })
+
+        let url = URL(string: "https://api.example.com/login")!
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: 200,
+            httpVersion: nil,
+            headerFields: ["Set-Cookie": "session=very-secret; HttpOnly"]
+        )
+        _ = try await interceptor.intercept(response: response, data: nil)
+
+        XCTAssertFalse(sink.text.contains("very-secret"))
+        XCTAssertTrue(sink.text.contains("Set-Cookie: ••••••"))
+    }
+
+    func testSensitiveHeaderKeywordsAreConfigurable() async throws {
+        let sink = LogSink()
+        let interceptor = KVLoggingInterceptor(
+            sensitiveHeaders: ["authorization"],
+            sensitiveHeaderKeywords: ["tenant"],
+            output: { sink.append($0) }
+        )
+
+        var request = makeRequest()
+        request.setValue("acme", forHTTPHeaderField: "X-Tenant-Id")
+        request.setValue("visible-token", forHTTPHeaderField: "X-Csrf-Token")
+        _ = try await interceptor.intercept(request: request)
+
+        XCTAssertFalse(sink.text.contains("acme"))
+        XCTAssertTrue(sink.text.contains("visible-token"), "Default keywords are replaced, not merged")
     }
 
     func testRedactionCanBeDisabled() async throws {
