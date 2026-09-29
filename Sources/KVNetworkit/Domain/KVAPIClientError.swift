@@ -9,7 +9,12 @@ import Foundation
 public enum KVAPIClientError: Error, LocalizedError, CustomNSError {
     /// The endpoint could not produce a valid `URLRequest`.
     case invalidURL
-    /// The request was unauthorized (401) and could not be recovered.
+    /// The request was unauthorized and could not be recovered.
+    ///
+    /// ``KVAPIClient`` does not throw this for a plain 401 response — that surfaces as
+    /// ``serverMessage(message:statusCode:)`` or ``statusCode(_:)`` with status 401, like any
+    /// other error status; match on ``statusCode`` to catch all of them. This case is for
+    /// interceptors and token-refresh flows that want to signal an unrecoverable session.
     case unauthorized
     /// The refresh token is invalid or expired.
     case refreshTokenInvalid

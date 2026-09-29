@@ -73,6 +73,20 @@ public protocol KVAPIEndpointProtocol {
     /// Per-request timeout override. Defaults to `nil` (session timeout applies).
     var timeout: TimeInterval? { get }
 
+    /// Retry behavior for this endpoint, replacing the client's ``KVAPIClient/retryPolicy``.
+    /// Defaults to `nil` (the client's policy applies).
+    ///
+    /// ```swift
+    /// var retryPolicy: KVRetryPolicy? {
+    ///     switch self {
+    ///     case .charge: return .never                                        // never replay
+    ///     case .search: return KVRetryPolicy(maxRetries: 2, retryableMethods: [.post])  // safe POST
+    ///     default: return nil
+    ///     }
+    /// }
+    /// ```
+    var retryPolicy: KVRetryPolicy? { get }
+
     /// The `URLRequest` built from the components above.
     var urlRequest: URLRequest? { get }
 }
@@ -86,6 +100,7 @@ public extension KVAPIEndpointProtocol {
     var body: KVHTTPBody? { nil }
     var cachePolicy: KVCachePolicy { .ignore }
     var timeout: TimeInterval? { nil }
+    var retryPolicy: KVRetryPolicy? { nil }
 
     /// Builds the `URLRequest` from the endpoint components.
     ///
@@ -106,7 +121,11 @@ public extension KVAPIEndpointProtocol {
         request.httpMethod = method.rawValue
 
         var allHeaders = headers
-        if let body, allHeaders["Content-Type"] == nil {
+        // Header names are case-insensitive: `content-type` must not get a second, derived value.
+        let declaresContentType = allHeaders.keys.contains {
+            $0.caseInsensitiveCompare("Content-Type") == .orderedSame
+        }
+        if let body, !declaresContentType {
             allHeaders["Content-Type"] = body.contentType
         }
         request.allHTTPHeaderFields = allHeaders

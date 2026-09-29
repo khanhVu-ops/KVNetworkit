@@ -17,6 +17,7 @@ private struct StreamEndpoint: KVAPIEndpointProtocol {
     var baseURL: String = "https://api.example.com"
     var headers: [String: String] = [:]
     var body: KVHTTPBody?
+    var retryPolicy: KVRetryPolicy?
 }
 
 private let streamURL = URL(string: "https://api.example.com/chat/stream")!
@@ -290,7 +291,8 @@ final class KVStreamingClientTests: XCTestCase {
         let client = KVAPIClient(
             session: session,
             interceptors: [],
-            retryPolicy: KVRetryPolicy(maxRetries: 2, baseDelay: 0.01)
+            // Streams here are POSTs, which are only retried when the policy opts them in.
+            retryPolicy: KVRetryPolicy(maxRetries: 2, baseDelay: 0.01, retryableMethods: [.post])
         )
 
         var received: [String] = []
@@ -312,19 +314,61 @@ final class KVStreamingClientTests: XCTestCase {
             chunks: KVMockNetworkSession.sseChunks(["recovered"]),
             response: okResponse()
         )
-        let client = KVAPIClient(
-            session: session,
-            interceptors: [],
-            retryPolicy: KVRetryPolicy(maxRetries: 1, baseDelay: 0.01)
-        )
+        let client = KVAPIClient(session: session, interceptors: [], retryPolicy: .never)
+
+        // The endpoint's own policy replaces the client's.
+        var endpoint = StreamEndpoint()
+        endpoint.retryPolicy = KVRetryPolicy(maxRetries: 1, baseDelay: 0.01, retryableMethods: [.post])
 
         var received: [String] = []
-        for try await event in try await client.streamEvents(StreamEndpoint()) {
+        for try await event in try await client.streamEvents(endpoint) {
             received.append(event.data)
         }
 
         XCTAssertEqual(received, ["recovered"])
         XCTAssertEqual(session.receivedRequests.count, 2)
+    }
+
+    func testPostStreamIsNotRetriedByDefault() async {
+        let session = KVMockNetworkSession()
+        session.enqueueStream(
+            chunks: [Data(#"{"message":"try later"}"#.utf8)],
+            response: KVMockNetworkSession.httpResponse(url: streamURL, statusCode: 503)
+        )
+        session.enqueueStream(chunks: KVMockNetworkSession.sseChunks(["recovered"]), response: okResponse())
+        let client = KVAPIClient(
+            session: session,
+            interceptors: [],
+            retryPolicy: KVRetryPolicy(maxRetries: 2, baseDelay: 0.01)
+        )
+
+        do {
+            _ = try await client.streamEvents(StreamEndpoint())
+            XCTFail("Expected the 503 to be surfaced")
+        } catch {
+            XCTAssertEqual((error as? KVAPIClientError)?.statusCode, 503)
+        }
+        XCTAssertEqual(session.receivedRequests.count, 1, "A POST (e.g. a chat message) must not be replayed")
+    }
+
+    func testStreamErrorResponseCanBeMapped() async {
+        let session = KVMockNetworkSession()
+        let body = Data(#"{"detail":"Insufficient credits","extra":{"requiredCredits":120}}"#.utf8)
+        session.enqueueStream(
+            chunks: [body],
+            response: KVMockNetworkSession.httpResponse(url: streamURL, statusCode: 402)
+        )
+        let client = KVAPIClient(session: session, interceptors: [], errorResponseMapper: { $0 })
+
+        do {
+            _ = try await client.stream(StreamEndpoint(), as: Delta.self)
+            XCTFail("Expected an error response")
+        } catch let error as KVHTTPErrorResponse {
+            XCTAssertEqual(error.statusCode, 402)
+            XCTAssertEqual(error.data, body)
+        } catch {
+            XCTFail("Expected KVHTTPErrorResponse, got \(error)")
+        }
     }
 
     // MARK: - Cancellation

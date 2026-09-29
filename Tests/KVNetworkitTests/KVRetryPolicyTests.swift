@@ -31,6 +31,38 @@ final class KVRetryPolicyTests: XCTestCase {
         XCTAssertFalse(policy.shouldRetry(error: CancellationError()))
     }
 
+    func testOnlyIdempotentMethodsAreRetriedByDefault() {
+        let policy = KVRetryPolicy.default
+        for method in ["GET", "HEAD", "PUT", "DELETE", "OPTIONS", "get", nil] {
+            XCTAssertTrue(policy.shouldRetry(method: method), "\(method ?? "nil") should be retryable")
+        }
+        XCTAssertFalse(policy.shouldRetry(method: "POST"))
+        XCTAssertFalse(policy.shouldRetry(method: "PATCH"))
+    }
+
+    func testMethodsCanBeOptedIn() {
+        let policy = KVRetryPolicy(maxRetries: 1, retryableMethods: [.post])
+        XCTAssertTrue(policy.shouldRetry(method: "POST"))
+        XCTAssertFalse(policy.shouldRetry(method: "GET"))
+    }
+
+    func testRetryAfterSecondsIsHonouredAndCapped() {
+        let policy = KVRetryPolicy(maxRetries: 2, baseDelay: 1, maxDelay: 30)
+        XCTAssertEqual(policy.delay(forAttempt: 1, retryAfter: "5"), 5)
+        XCTAssertEqual(policy.delay(forAttempt: 1, retryAfter: " 0 "), 0)
+        XCTAssertEqual(policy.delay(forAttempt: 1, retryAfter: "3600"), 30, "Capped at maxDelay")
+
+        // Unparsable or missing: exponential backoff (~1s ±20%).
+        XCTAssertTrue((0.8...1.2).contains(policy.delay(forAttempt: 1, retryAfter: "soon")))
+        XCTAssertTrue((0.8...1.2).contains(policy.delay(forAttempt: 1, retryAfter: nil)))
+    }
+
+    func testRetryAfterHTTPDateIsParsed() {
+        let now = Date(timeIntervalSince1970: 1_445_412_470)   // 21 Oct 2015 07:27:50 GMT
+        let seconds = KVRetryPolicy.parseRetryAfter("Wed, 21 Oct 2015 07:28:00 GMT", now: now)
+        XCTAssertEqual(seconds ?? -1, 10, accuracy: 0.001)
+    }
+
     func testBackoffGrowsExponentiallyAndIsCapped() {
         let policy = KVRetryPolicy(maxRetries: 10, baseDelay: 1.0, maxDelay: 5.0)
 

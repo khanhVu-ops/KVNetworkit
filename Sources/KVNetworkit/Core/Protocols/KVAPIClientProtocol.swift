@@ -196,20 +196,36 @@ public extension KVAPIClientProtocol {
         id: String = UUID().uuidString
     ) async throws -> AsyncThrowingStream<T, any Error> {
         let events = try await streamEvents(endpoint, framing: framing, id: id)
+        // Decoded on demand, in the consumer's task: `T` never crosses a task boundary, so it
+        // does not have to be `Sendable`. Dropping this stream releases `events`, which
+        // cancels the request.
+        return KVDecodingEventIterator<T>(events.makeAsyncIterator(), decoder: decoder).makeStream()
+    }
+}
 
-        return AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
-            let pump = Task {
-                do {
-                    for try await event in events {
-                        guard !event.isDoneSentinel, !event.data.isEmpty else { continue }
-                        continuation.yield(try event.decode(T.self, decoder: decoder))
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in pump.cancel() }
+/// The pull side of ``KVAPIClientProtocol/stream(_:as:decoder:framing:id:)``.
+///
+/// `@unchecked Sendable` because `AsyncThrowingStream(unfolding:)` requires a `@Sendable`
+/// closure, but only ever calls it from its single consumer, one call at a time.
+final class KVDecodingEventIterator<T: Decodable>: @unchecked Sendable {
+    private var events: AsyncThrowingStream<KVServerSentEvent, any Error>.Iterator
+    private let decoder: JSONDecoder
+
+    init(_ events: AsyncThrowingStream<KVServerSentEvent, any Error>.Iterator, decoder: JSONDecoder) {
+        self.events = events
+        self.decoder = decoder
+    }
+
+    func makeStream() -> AsyncThrowingStream<T, any Error> {
+        AsyncThrowingStream { try await self.next() }
+    }
+
+    /// The next decoded payload, skipping the `[DONE]` sentinel and empty payloads.
+    func next() async throws -> T? {
+        while let event = try await events.next() {
+            guard !event.isDoneSentinel, !event.data.isEmpty else { continue }
+            return try event.decode(T.self, decoder: decoder)
         }
+        return nil
     }
 }

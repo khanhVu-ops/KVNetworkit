@@ -22,9 +22,21 @@ public final class KVMockAPIClient: KVAPIClientProtocol, @unchecked Sendable {
     private var stubbedData: [String: Data] = [:]
     private var stubbedStreams: [String: [Data]] = [:]
     private var _requestedPaths: [String] = []
+    private var _stubbedError: Error?
 
-    /// When set, every request throws this error.
-    public var stubbedError: Error?
+    /// When set, every request throws this error. Safe to set while requests are in flight.
+    public var stubbedError: Error? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _stubbedError
+        }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            _stubbedError = newValue
+        }
+    }
 
     public init() {}
 
@@ -74,7 +86,7 @@ public final class KVMockAPIClient: KVAPIClientProtocol, @unchecked Sendable {
         stubbedData.removeAll()
         stubbedStreams.removeAll()
         _requestedPaths.removeAll()
-        stubbedError = nil
+        _stubbedError = nil
     }
 
     // MARK: - KVAPIClientProtocol
